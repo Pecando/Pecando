@@ -1,4 +1,9 @@
-"""Async REST client for the Kalshi Trade API v2.
+"""Async client for the Kalshi Trade API v2: REST via httpx, live market data via websockets.
+
+Credentials come from the environment (see `RequestSigner.from_env`):
+    KALSHI_API_KEY_ID        API key ID
+    KALSHI_PRIVATE_KEY_PATH  path to the PEM private key (or KALSHI_PRIVATE_KEY with the PEM itself)
+    KALSHI_ENV               "demo" (default) or "prod"
 
 Prices are fixed-point dollar strings (up to 4 decimals, e.g. "0.5600") and counts are
 fixed-point strings (up to 2 decimals, e.g. "10.00"). This module accepts `Decimal`,
@@ -10,11 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import random
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -26,6 +32,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+
+from math_utils import mid_implied_probability
 
 Environment = Literal["prod", "demo"]
 OrderSide = Literal["bid", "ask"]
@@ -103,6 +114,20 @@ class RequestSigner:
         """Load a PEM private key from disk."""
         return cls.from_pem(key_id, Path(path).read_bytes(), password)
 
+    @classmethod
+    def from_env(cls) -> RequestSigner:
+        """Load from KALSHI_API_KEY_ID plus KALSHI_PRIVATE_KEY (PEM text) or KALSHI_PRIVATE_KEY_PATH."""
+        key_id = os.environ.get("KALSHI_API_KEY_ID")
+        if not key_id:
+            raise RuntimeError("KALSHI_API_KEY_ID is not set")
+        pem = os.environ.get("KALSHI_PRIVATE_KEY")
+        if pem:
+            return cls.from_pem(key_id, pem.replace("\\n", "\n"))
+        path = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+        if not path:
+            raise RuntimeError("set KALSHI_PRIVATE_KEY_PATH or KALSHI_PRIVATE_KEY")
+        return cls.from_file(key_id, path)
+
     def sign(self, message: bytes) -> bytes:
         """Return the raw signature over `message`."""
         if isinstance(self._key, Ed25519PrivateKey):
@@ -173,44 +198,148 @@ def snap_price(price: Number, price_ranges: Sequence[Mapping[str, str]], side: O
     raise ValueError(f"price {p} is outside every price range")
 
 
-@dataclass(frozen=True, slots=True)
-class Orderbook:
-    """Resting bids on each side. Levels are (price, size), best first.
+_TICKS_PER_DOLLAR = 10_000  # 1 tick = $0.0001, the finest Kalshi price increment
+_COUNT_SCALE = 100  # counts carry 2 decimals
 
-    Kalshi books show bids only: a YES ask is implied by a NO bid at 1 - price.
+
+def _parse_fixed(text: str, places: int) -> int:
+    """Parse a fixed-point decimal string into an integer scaled by 10**places, exactly."""
+    neg = text.startswith("-")
+    whole, _, frac = (text[1:] if neg else text).partition(".")
+    if len(frac) > places:
+        if frac[places:].strip("0"):
+            raise ValueError(f"{text!r} has more than {places} decimal places")
+        frac = frac[:places]
+    value = int(whole or "0") * 10**places + int(frac.ljust(places, "0"))
+    return -value if neg else value
+
+
+def _ticks_to_decimal(ticks: int) -> Decimal:
+    return Decimal(ticks).scaleb(-4)
+
+
+class Orderbook:
+    """Mutable L2 book for one market, stored as integer ticks for cheap updates.
+
+    Kalshi books carry bids only: a YES ask is implied by a NO bid at 1 - price, and a
+    NO ask by a YES bid. The best bid on each side is cached so a delta is O(1) unless it
+    removes the top level.
     """
 
-    yes_bids: tuple[tuple[Decimal, Decimal], ...]
-    no_bids: tuple[tuple[Decimal, Decimal], ...]
+    __slots__ = ("ticker", "_yes", "_no", "_best_yes", "_best_no")
+
+    def __init__(self, ticker: str = ""):
+        self.ticker = ticker
+        self._yes: dict[int, int] = {}
+        self._no: dict[int, int] = {}
+        self._best_yes: int | None = None
+        self._best_no: int | None = None
 
     @classmethod
-    def from_response(cls, body: Mapping[str, Any]) -> Orderbook:
-        book = body["orderbook_fp"]
+    def from_response(cls, body: Mapping[str, Any], ticker: str = "") -> Orderbook:
+        """Build from a REST `GET /markets/{ticker}/orderbook` response."""
+        book = cls(ticker)
+        raw = body["orderbook_fp"]
+        book.load(raw.get("yes_dollars"), raw.get("no_dollars"))
+        return book
 
-        def levels(raw: Sequence[Sequence[str]] | None) -> tuple[tuple[Decimal, Decimal], ...]:
-            parsed = ((Decimal(px), Decimal(qty)) for px, qty in raw or ())
-            return tuple(sorted(parsed, key=lambda lvl: lvl[0], reverse=True))
+    def load(self, yes_levels: Sequence[Sequence[str]] | None, no_levels: Sequence[Sequence[str]] | None) -> None:
+        """Replace the book with full snapshot levels of (dollars, count) strings."""
+        self._yes = {_parse_fixed(px, 4): _parse_fixed(qty, 2) for px, qty in yes_levels or ()}
+        self._no = {_parse_fixed(px, 4): _parse_fixed(qty, 2) for px, qty in no_levels or ()}
+        self._best_yes = max(self._yes, default=None)
+        self._best_no = max(self._no, default=None)
 
-        return cls(levels(book.get("yes_dollars")), levels(book.get("no_dollars")))
+    def apply_delta(self, side: str, price_ticks: int, delta: int) -> bool:
+        """Apply a size change at one level. Return True if either top of book moved or resized."""
+        if side == "yes":
+            levels, before = self._yes, self._best_yes
+        else:
+            levels, before = self._no, self._best_no
+        best = before
+        qty = levels.get(price_ticks, 0) + delta
+        if qty > 0:
+            levels[price_ticks] = qty
+            if best is None or price_ticks > best:
+                best = price_ticks
+        else:
+            levels.pop(price_ticks, None)
+            if price_ticks == best:
+                best = max(levels, default=None)
+        if side == "yes":
+            self._best_yes = best
+        else:
+            self._best_no = best
+        return best != before or price_ticks == best
+
+    # Integer accessors for hot paths: prices in ticks of $0.0001.
+
+    @property
+    def best_yes_bid_ticks(self) -> int | None:
+        return self._best_yes
+
+    @property
+    def best_yes_ask_ticks(self) -> int | None:
+        return None if self._best_no is None else _TICKS_PER_DOLLAR - self._best_no
+
+    def size_at(self, side: str, price_ticks: int) -> Decimal:
+        """Return resting contracts at a level of the YES or NO bid book."""
+        qty = (self._yes if side == "yes" else self._no).get(price_ticks, 0)
+        return Decimal(qty).scaleb(-2)
+
+    # Decimal accessors.
+
+    @property
+    def yes_bids(self) -> tuple[tuple[Decimal, Decimal], ...]:
+        return tuple((_ticks_to_decimal(p), Decimal(q).scaleb(-2)) for p, q in sorted(self._yes.items(), reverse=True))
+
+    @property
+    def no_bids(self) -> tuple[tuple[Decimal, Decimal], ...]:
+        return tuple((_ticks_to_decimal(p), Decimal(q).scaleb(-2)) for p, q in sorted(self._no.items(), reverse=True))
 
     @property
     def best_yes_bid(self) -> Decimal | None:
-        return self.yes_bids[0][0] if self.yes_bids else None
+        return None if self._best_yes is None else _ticks_to_decimal(self._best_yes)
 
     @property
     def best_yes_ask(self) -> Decimal | None:
-        return Decimal(1) - self.no_bids[0][0] if self.no_bids else None
+        return None if self._best_no is None else _ticks_to_decimal(_TICKS_PER_DOLLAR - self._best_no)
 
     @property
     def best_no_bid(self) -> Decimal | None:
-        return self.no_bids[0][0] if self.no_bids else None
+        return None if self._best_no is None else _ticks_to_decimal(self._best_no)
 
     @property
     def best_no_ask(self) -> Decimal | None:
-        return Decimal(1) - self.yes_bids[0][0] if self.yes_bids else None
+        return None if self._best_yes is None else _ticks_to_decimal(_TICKS_PER_DOLLAR - self._best_yes)
+
+    @property
+    def mid(self) -> Decimal | None:
+        """YES mid-market price in dollars, or None if either side is empty."""
+        ask = self.best_yes_ask_ticks
+        if self._best_yes is None or ask is None:
+            return None
+        return Decimal(self._best_yes + ask).scaleb(-4) / 2
+
+    @property
+    def implied_probability(self) -> float | None:
+        """Implied YES probability of the mid-market price, via `math_utils`."""
+        ask = self.best_yes_ask_ticks
+        bid = self._best_yes
+        return mid_implied_probability(
+            None if bid is None else bid / _TICKS_PER_DOLLAR,
+            None if ask is None else ask / _TICKS_PER_DOLLAR,
+        )
 
 
 # --------------------------------------------------------------------------- client
+
+
+def _env_name() -> Environment:
+    env = os.environ.get("KALSHI_ENV", "demo")
+    if env not in BASE_URLS:
+        raise ValueError(f"KALSHI_ENV must be one of {sorted(BASE_URLS)}, got {env!r}")
+    return env  # type: ignore[return-value]
 
 
 def _clean(params: Mapping[str, Any]) -> dict[str, Any]:
@@ -248,12 +377,8 @@ class KalshiClient:
 
     @classmethod
     def from_env(cls, environment: Environment | None = None, **kwargs: Any) -> KalshiClient:
-        """Build from KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH and optional KALSHI_ENV."""
-        signer = RequestSigner.from_file(os.environ["KALSHI_API_KEY_ID"], os.environ["KALSHI_PRIVATE_KEY_PATH"])
-        env = environment or os.environ.get("KALSHI_ENV", "demo")
-        if env not in BASE_URLS:
-            raise ValueError(f"KALSHI_ENV must be one of {sorted(BASE_URLS)}, got {env!r}")
-        return cls(signer, environment=env, **kwargs)  # type: ignore[arg-type]
+        """Build with credentials and KALSHI_ENV from the environment."""
+        return cls(RequestSigner.from_env(), environment=environment or _env_name(), **kwargs)
 
     async def __aenter__(self) -> KalshiClient:
         return self
@@ -348,7 +473,7 @@ class KalshiClient:
         body = await self._request(
             "GET", f"/markets/{ticker}/orderbook", params={"depth": depth}
         )
-        return Orderbook.from_response(body)
+        return Orderbook.from_response(body, ticker)
 
     async def get_event(self, event_ticker: str, **params: Any) -> dict[str, Any]:
         """Return an event (`event`, and `markets` when requested)."""
@@ -459,3 +584,292 @@ class KalshiClient:
     async def cancel_all_orders(self, subaccount: int | None = None) -> None:
         """Cancel every resting order (all subaccounts when `subaccount` is omitted)."""
         await self._request("DELETE", "/portfolio/events/orders", params={"subaccount": subaccount}, auth=True)
+
+
+# --------------------------------------------------------------------------- websocket stream
+
+try:  # orjson parses ~3-5x faster than the stdlib on large snapshots
+    import orjson
+
+    _loads: Callable[[str | bytes], Any] = orjson.loads
+
+    def _dumps(obj: Any) -> str:
+        return orjson.dumps(obj).decode()
+
+except ImportError:  # pragma: no cover - exercised only without orjson
+    _loads = json.loads
+    _dumps = json.dumps
+
+WS_URLS: dict[str, str] = {
+    "prod": "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+    "demo": "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
+}
+
+
+class KalshiStreamError(Exception):
+    """Error message from the WebSocket server, or a rejected handshake."""
+
+    def __init__(self, code: int | None, message: str):
+        super().__init__(f"Kalshi stream error {code}: {message}")
+        self.code = code
+        self.message = message
+
+
+@dataclass(frozen=True, slots=True)
+class Quote:
+    """Top of book for one market, emitted whenever the best YES bid or ask moves or resizes.
+
+    Prices are integer ticks of $0.0001; use the Decimal properties off the hot path.
+    """
+
+    ticker: str
+    bid_ticks: int | None
+    ask_ticks: int | None
+    bid_size: float
+    ask_size: float
+    implied_probability: float | None  # of the mid-market price, via math_utils
+    seq: int
+    exchange_ts_ms: int | None
+    received_ns: int  # time.time_ns() when the frame was read
+
+    @property
+    def bid(self) -> Decimal | None:
+        return None if self.bid_ticks is None else _ticks_to_decimal(self.bid_ticks)
+
+    @property
+    def ask(self) -> Decimal | None:
+        return None if self.ask_ticks is None else _ticks_to_decimal(self.ask_ticks)
+
+    @property
+    def mid(self) -> Decimal | None:
+        if self.bid_ticks is None or self.ask_ticks is None:
+            return None
+        return Decimal(self.bid_ticks + self.ask_ticks).scaleb(-4) / 2
+
+
+@dataclass(frozen=True, slots=True)
+class Trade:
+    """A public trade print."""
+
+    ticker: str
+    trade_id: str
+    yes_price: Decimal
+    count: Decimal
+    taker_side: str
+    ts_ms: int | None
+    received_ns: int
+
+
+QuoteHandler = Callable[[Quote], None]
+TradeHandler = Callable[[Trade], None]
+
+
+class MarketStream:
+    """Live order books and trades for a set of markets over one WebSocket.
+
+    Subscribes to `orderbook_delta` (and `trade` unless disabled), keeps an `Orderbook`
+    per ticker, and calls `on_quote` each time a top of book changes. Handlers run inline
+    on the read loop for minimum latency, so keep them non-blocking; hand slow work to a
+    task or queue.
+
+    On a sequence gap the affected subscription is resnapshotted and its deltas are
+    dropped until the snapshot lands. Dropped connections reconnect with backoff, sign a
+    fresh handshake, and resubscribe. Server error messages and rejected handshakes
+    (401/403) raise `KalshiStreamError` and stop the stream.
+    """
+
+    def __init__(
+        self,
+        signer: RequestSigner,
+        market_tickers: Sequence[str],
+        *,
+        on_quote: QuoteHandler | None = None,
+        on_trade: TradeHandler | None = None,
+        environment: Environment = "demo",
+        url: str | None = None,
+        trades: bool = True,
+        reconnect: bool = True,
+        max_backoff: float = 5.0,
+        ping_interval: float | None = 10.0,
+        ping_timeout: float | None = 10.0,
+    ):
+        if not market_tickers:
+            raise ValueError("market_tickers must not be empty")
+        self.url = url or WS_URLS[environment]
+        self.books: dict[str, Orderbook] = {t: Orderbook(t) for t in market_tickers}
+        self.on_quote = on_quote
+        self.on_trade = on_trade
+        self._signer = signer
+        self._path = urlsplit(self.url).path
+        self._trades = trades
+        self._reconnect = reconnect
+        self._max_backoff = max_backoff
+        self._ping_interval = ping_interval
+        self._ping_timeout = ping_timeout
+        self._ws: ClientConnection | None = None
+        self._closed = False
+        self._next_id = 0
+        self._book_sid: int | None = None
+        self._last_seq: dict[int, int] = {}
+        self._awaiting_snapshot: set[str] = set()  # tickers whose deltas are dropped until a snapshot
+        self._tasks: set[asyncio.Task[None]] = set()
+        self.gaps = 0  # sequence gaps detected, for monitoring
+
+    @classmethod
+    def from_env(cls, market_tickers: Sequence[str], environment: Environment | None = None, **kwargs: Any) -> MarketStream:
+        """Build with credentials from the environment (see `RequestSigner.from_env`)."""
+        return cls(RequestSigner.from_env(), market_tickers, environment=environment or _env_name(), **kwargs)
+
+    async def run(self) -> None:
+        """Connect and stream until `close()` is called or a fatal error is raised."""
+        attempt = 0
+        while not self._closed:
+            try:
+                async with ws_connect(
+                    self.url,
+                    additional_headers=self._signer.headers("GET", self._path),
+                    compression=None,  # deflate costs CPU per frame; latency matters more than bytes
+                    max_size=None,
+                    ping_interval=self._ping_interval,
+                    ping_timeout=self._ping_timeout,
+                    open_timeout=10,
+                ) as ws:
+                    self._ws = ws
+                    attempt = 0
+                    self._reset_session()
+                    await self._subscribe()
+                    handle = self._handle
+                    async for raw in ws:
+                        handle(raw)
+            except InvalidStatus as exc:
+                status = exc.response.status_code
+                if status in (401, 403):
+                    raise KalshiStreamError(status, "handshake rejected: check API key and signature") from exc
+                if not self._reconnect:
+                    raise
+            except (ConnectionClosed, OSError, TimeoutError):
+                if self._closed:
+                    return
+                if not self._reconnect:
+                    raise
+            finally:
+                self._ws = None
+            if self._closed or not self._reconnect:
+                return
+            await asyncio.sleep(random.uniform(0, min(self._max_backoff, 0.1 * 2**attempt)))
+            attempt += 1
+
+    async def close(self) -> None:
+        """Stop the stream and close the socket."""
+        self._closed = True
+        if self._ws is not None:
+            await self._ws.close()
+
+    # ------------------------------------------------------------------ protocol
+
+    def _reset_session(self) -> None:
+        self._book_sid = None
+        self._last_seq.clear()
+        self._awaiting_snapshot = set(self.books)
+
+    def _command(self, cmd: str, params: Mapping[str, Any]) -> str:
+        self._next_id += 1
+        return _dumps({"id": self._next_id, "cmd": cmd, "params": params})
+
+    async def _subscribe(self) -> None:
+        assert self._ws is not None
+        tickers = list(self.books)
+        await self._ws.send(self._command("subscribe", {"channels": ["orderbook_delta"], "market_tickers": tickers}))
+        if self._trades:
+            await self._ws.send(self._command("subscribe", {"channels": ["trade"], "market_tickers": tickers}))
+
+    def _request_snapshot(self, sid: int) -> None:
+        if self._awaiting_snapshot or self._ws is None:
+            return
+        self._awaiting_snapshot = set(self.books)
+        frame = self._command(
+            "update_subscription", {"sid": sid, "action": "get_snapshot", "market_tickers": list(self.books)}
+        )
+        task = asyncio.get_running_loop().create_task(self._ws.send(frame))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _handle(self, raw: str | bytes) -> None:
+        """Dispatch one frame. Synchronous so the read loop never yields mid-update."""
+        received_ns = time.time_ns()
+        frame = _loads(raw)
+        kind = frame.get("type")
+        if kind == "orderbook_delta":
+            self._on_delta(frame, received_ns)
+        elif kind == "orderbook_snapshot":
+            self._on_snapshot(frame, received_ns)
+        elif kind == "trade":
+            self._on_trade(frame, received_ns)
+        elif kind == "subscribed":
+            msg = frame["msg"]
+            if msg.get("channel") == "orderbook_delta":
+                self._book_sid = msg["sid"]
+        elif kind == "error":
+            msg = frame.get("msg", {})
+            raise KalshiStreamError(msg.get("code"), msg.get("msg", "unknown error"))
+
+    def _on_snapshot(self, frame: dict[str, Any], received_ns: int) -> None:
+        seq = frame["seq"]
+        self._last_seq[frame["sid"]] = seq
+        msg = frame["msg"]
+        book = self.books.get(msg["market_ticker"])
+        if book is None:
+            return
+        book.load(msg.get("yes_dollars_fp"), msg.get("no_dollars_fp"))
+        self._awaiting_snapshot.discard(book.ticker)
+        self._emit(book, seq, frame.get("sending_ts_ms"), received_ns)
+
+    def _on_delta(self, frame: dict[str, Any], received_ns: int) -> None:
+        sid, seq = frame["sid"], frame["seq"]
+        last = self._last_seq.get(sid)
+        self._last_seq[sid] = seq
+        if last is not None and seq != last + 1 and not self._awaiting_snapshot:
+            self.gaps += 1
+            self._request_snapshot(sid)
+            return
+        msg = frame["msg"]
+        book = self.books.get(msg["market_ticker"])
+        if book is None or book.ticker in self._awaiting_snapshot:
+            return
+        if book.apply_delta(msg["side"], _parse_fixed(msg["price_dollars"], 4), _parse_fixed(msg["delta_fp"], 2)):
+            self._emit(book, seq, frame.get("sending_ts_ms"), received_ns)
+
+    def _emit(self, book: Orderbook, seq: int, exchange_ts_ms: int | None, received_ns: int) -> None:
+        if self.on_quote is None:
+            return
+        bid, ask = book.best_yes_bid_ticks, book.best_yes_ask_ticks
+        no_bid = book._best_no
+        self.on_quote(
+            Quote(
+                ticker=book.ticker,
+                bid_ticks=bid,
+                ask_ticks=ask,
+                bid_size=book._yes[bid] / _COUNT_SCALE if bid is not None else 0.0,
+                ask_size=book._no[no_bid] / _COUNT_SCALE if no_bid is not None else 0.0,
+                implied_probability=book.implied_probability,
+                seq=seq,
+                exchange_ts_ms=exchange_ts_ms,
+                received_ns=received_ns,
+            )
+        )
+
+    def _on_trade(self, frame: dict[str, Any], received_ns: int) -> None:
+        if self.on_trade is None:
+            return
+        msg = frame["msg"]
+        self.on_trade(
+            Trade(
+                ticker=msg["market_ticker"],
+                trade_id=msg.get("trade_id", ""),
+                yes_price=Decimal(msg["yes_price_dollars"]),
+                count=Decimal(msg["count_fp"]),
+                taker_side=msg.get("taker_side", ""),
+                ts_ms=msg.get("ts_ms"),
+                received_ns=received_ns,
+            )
+        )

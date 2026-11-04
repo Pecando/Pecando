@@ -41,6 +41,24 @@ def probability_to_price(probability: float) -> int:
     return min(MAX_PRICE_CENTS, max(MIN_PRICE_CENTS, round(probability * 100)))
 
 
+def mid_price(best_bid: float, best_ask: float) -> float:
+    """Return the midpoint of a two-sided quote in dollars. Accepts sub-cent prices."""
+    if not 0.0 <= best_bid <= best_ask <= PAYOUT_DOLLARS:
+        raise ValueError(f"need 0 <= bid <= ask <= 1, got bid={best_bid} ask={best_ask}")
+    return (best_bid + best_ask) * 0.5
+
+
+def mid_implied_probability(best_bid: float | None, best_ask: float | None) -> float | None:
+    """Return the implied probability of the mid-market price, or None if a side is empty.
+
+    On a $1.00-payout contract the dollar price is the probability, so this is the
+    midpoint scaled by the payout.
+    """
+    if best_bid is None or best_ask is None:
+        return None
+    return mid_price(best_bid, best_ask) / PAYOUT_DOLLARS
+
+
 def price_to_decimal_odds(price_cents: int) -> float:
     """Return decimal odds (total return per $1 staked, stake included). 16c -> 6.25."""
     _validate_price(price_cents)
